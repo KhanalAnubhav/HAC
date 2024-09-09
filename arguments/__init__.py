@@ -58,7 +58,9 @@ class ModelParams(ParamGroup):
         self._source_path = ""
         self._model_path = ""
         self._images = "images"
+        self._language_features_name = "language_features_dim3"
         self._resolution = -1
+        self._feature_level = -1
         self._white_background = False
         self.data_device = "cuda"
         self.eval = True
@@ -68,6 +70,7 @@ class ModelParams(ParamGroup):
     def extract(self, args):
         g = super().extract(args)
         g.source_path = os.path.abspath(g.source_path)
+        g.lf_path = os.path.join(g.source_path, g.language_features_name)
         return g
 
 class PipelineParams(ParamGroup):
@@ -79,7 +82,7 @@ class PipelineParams(ParamGroup):
 
 class OptimizationParams(ParamGroup):
     def __init__(self, parser):
-        self.iterations = 30_000
+        self.iterations = 10_000
         self.position_lr_init = 0.0
         self.position_lr_final = 0.0
         self.position_lr_delay_mult = 0.01
@@ -135,8 +138,18 @@ class OptimizationParams(ParamGroup):
         self.mlp_deform_lr_delay_mult = 0.01
         self.mlp_deform_lr_max_steps = 30_000
 
+        # taking the language lr to have the same values as the feature lr
+        #self.language_feature_lr = 0.0025
+        self.mlp_lang_feat_lr_init = 0.008
+        self.mlp_lang_feat_lr_final = 0.00005
+        self.mlp_lang_feat_lr_delay_mult = 0.01
+        self.mlp_lang_feat_lr_max_steps = 30_000
+        self.include_feature = True
+        
+
         self.percent_dense = 0.01
         self.lambda_dssim = 0.2
+        self.lambda_lang = 1
         
         # for anchor densification
         self.start_stat = 500

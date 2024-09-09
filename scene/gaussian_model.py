@@ -140,6 +140,7 @@ class GaussianModel(nn.Module):
                  Q=1,
                  use_2D: bool=True,
                  decoded_version: bool=False,
+                 include_feature: bool=True
                  ):
         super().__init__()
         print('hash_params:', use_2D, n_features_per_level,
@@ -168,6 +169,8 @@ class GaussianModel(nn.Module):
         self.Q = Q
         self.use_2D = use_2D
         self.decoded_version = decoded_version
+        
+        self.include_feature = include_feature
 
         self._anchor = torch.empty(0)
         self._offset = torch.empty(0)
@@ -231,6 +234,15 @@ class GaussianModel(nn.Module):
             ).cuda()
 
         mlp_input_feat_dim = feat_dim
+
+
+        if self.include_feature:
+            self.mlp_lang_feat = nn.Sequential(
+                nn.Linear(mlp_input_feat_dim+3+1, feat_dim),
+                nn.ReLU(True),
+                nn.Linear(feat_dim, 3*self.n_offsets),
+                nn.Tanh()
+            ).cuda()
 
         self.mlp_opacity = nn.Sequential(
             nn.Linear(mlp_input_feat_dim+3+1, feat_dim),
@@ -300,6 +312,9 @@ class GaussianModel(nn.Module):
         if self.use_feat_bank:
             self.mlp_feature_bank.eval()
 
+        if self.include_feature:
+            self.mlp_lang_feat.eval()
+
     def train(self):
         self.mlp_opacity.train()
         self.mlp_cov.train()
@@ -307,6 +322,9 @@ class GaussianModel(nn.Module):
         self.encoding_xyz.train()
         self.mlp_grid.train()
         self.mlp_deform.train()
+
+        if self.include_feature:
+            self.mlp_lang_feat.train()
 
         if self.use_feat_bank:
             self.mlp_feature_bank.train()
@@ -376,6 +394,10 @@ class GaussianModel(nn.Module):
     @property
     def get_cov_mlp(self):
         return self.mlp_cov
+    
+    @property
+    def get_lang_feat_mlp(self):
+        return self.mlp_lang_feat
 
     @property
     def get_color_mlp(self):
@@ -490,6 +512,27 @@ class GaussianModel(nn.Module):
         self.offset_denom = torch.zeros((self.get_anchor.shape[0]*self.n_offsets, 1), device="cuda")
         self.anchor_demon = torch.zeros((self.get_anchor.shape[0], 1), device="cuda")
 
+        if self.include_feature:
+            l = [
+                {'params': [self._anchor], 'lr': training_args.position_lr_init * self.spatial_lr_scale, "name": "anchor"},
+                {'params': [self._offset], 'lr': training_args.offset_lr_init * self.spatial_lr_scale, "name": "offset"},
+                {'params': [self._mask], 'lr': training_args.mask_lr_init * self.spatial_lr_scale, "name": "mask"},
+                {'params': [self._anchor_feat], 'lr': training_args.feature_lr, "name": "anchor_feat"},
+                {'params': [self._opacity], 'lr': training_args.opacity_lr, "name": "opacity"},
+                {'params': [self._scaling], 'lr': training_args.scaling_lr, "name": "scaling"},
+                {'params': [self._rotation], 'lr': training_args.rotation_lr, "name": "rotation"},
+
+                {'params': self.mlp_opacity.parameters(), 'lr': training_args.mlp_opacity_lr_init, "name": "mlp_opacity"},
+                {'params': self.mlp_lang_feat.parameters(), 'lr': training_args.mlp_lang_feat_lr_init, "name": "mlp_lang_feat"},
+                # {'params': self.mlp_feature_bank.parameters(), 'lr': training_args.mlp_featurebank_lr_init, "name": "mlp_featurebank"},
+                {'params': self.mlp_cov.parameters(), 'lr': training_args.mlp_cov_lr_init, "name": "mlp_cov"},
+                {'params': self.mlp_color.parameters(), 'lr': training_args.mlp_color_lr_init, "name": "mlp_color"},
+
+                {'params': self.encoding_xyz.parameters(), 'lr': training_args.encoding_xyz_lr_init, "name": "encoding_xyz"},
+                {'params': self.mlp_grid.parameters(), 'lr': training_args.mlp_grid_lr_init, "name": "mlp_grid"},
+
+                {'params': self.mlp_deform.parameters(), 'lr': training_args.mlp_deform_lr_init, "name": "mlp_deform"},
+            ]
         if self.use_feat_bank:
             l = [
                 {'params': [self._anchor], 'lr': training_args.position_lr_init * self.spatial_lr_scale, "name": "anchor"},
@@ -558,6 +601,11 @@ class GaussianModel(nn.Module):
                                                     lr_final=training_args.mlp_color_lr_final,
                                                     lr_delay_mult=training_args.mlp_color_lr_delay_mult,
                                                     max_steps=training_args.mlp_color_lr_max_steps)
+        if self.include_feature:
+            self.mlp_lang_feat_scheduler_args = get_expon_lr_func(lr_init=training_args.mlp_lang_feat_lr_init,
+                                                        lr_final=training_args.mlp_lang_feat_lr_final,
+                                                        lr_delay_mult=training_args.mlp_lang_feat_lr_delay_mult,
+                                                        max_steps=training_args.mlp_lang_feat_lr_max_steps)
         if self.use_feat_bank:
             self.mlp_featurebank_scheduler_args = get_expon_lr_func(lr_init=training_args.mlp_featurebank_lr_init,
                                                         lr_final=training_args.mlp_featurebank_lr_final,
@@ -605,6 +653,8 @@ class GaussianModel(nn.Module):
                 param_group['lr'] = lr
             if param_group["name"] == "mlp_color":
                 lr = self.mlp_color_scheduler_args(iteration)
+            if self.include_feature and param_group["name"] == "mlp_lang_feat":
+                lr = self.mlp_lang_feat_scheduler_args(iteration)
                 param_group['lr'] = lr
             if param_group["name"] == "encoding_xyz":
                 lr = self.encoding_xyz_scheduler_args(iteration)
@@ -700,6 +750,7 @@ class GaussianModel(nn.Module):
         self._opacity = nn.Parameter(torch.tensor(opacities, dtype=torch.float, device="cuda").requires_grad_(True))
         self._scaling = nn.Parameter(torch.tensor(scales, dtype=torch.float, device="cuda").requires_grad_(True))
         self._rotation = nn.Parameter(torch.tensor(rots, dtype=torch.float, device="cuda").requires_grad_(True))
+
 
 
     def replace_tensor_to_optimizer(self, tensor, name):
@@ -964,6 +1015,17 @@ class GaussianModel(nn.Module):
                 'grid_mlp': self.mlp_grid.state_dict(),
                 'deform_mlp': self.mlp_deform.state_dict(),
             }, path)
+        if self.include_feature:
+            torch.save({
+                'opacity_mlp': self.mlp_opacity.state_dict(),
+                # 'mlp_feature_bank': self.mlp_feature_bank.state_dict(),
+                'cov_mlp': self.mlp_cov.state_dict(),
+                'color_mlp': self.mlp_color.state_dict(),
+                'lang_feat_mlp': self.mlp_lang_feat.state_dict(),
+                'encoding_xyz': self.encoding_xyz.state_dict(),
+                'grid_mlp': self.mlp_grid.state_dict(),
+                'deform_mlp': self.mlp_deform.state_dict(),
+            }, path)
         else:
             torch.save({
                 'opacity_mlp': self.mlp_opacity.state_dict(),
@@ -985,6 +1047,8 @@ class GaussianModel(nn.Module):
         self.encoding_xyz.load_state_dict(checkpoint['encoding_xyz'])
         self.mlp_grid.load_state_dict(checkpoint['grid_mlp'])
         self.mlp_deform.load_state_dict(checkpoint['deform_mlp'])
+        if self.include_feature:
+            self.mlp_lang_feat.load_state_dict(checkpoint['lang_feat_mlp'])
 
     def contract_to_unisphere(self,
         x: torch.Tensor,

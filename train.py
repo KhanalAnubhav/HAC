@@ -97,6 +97,7 @@ def training(args_param, dataset, opt, pipe, dataset_name, testing_iterations, s
         dataset.update_init_factor,
         dataset.update_hierachy_factor,
         dataset.use_feat_bank,
+        include_feature=opt.include_feature,
         n_features_per_level=args_param.n_features,
         log2_hashmap_size=args_param.log2,
         log2_hashmap_size_2D=args_param.log2_2D,
@@ -105,10 +106,17 @@ def training(args_param, dataset, opt, pipe, dataset_name, testing_iterations, s
     gaussians.update_anchor_bound()
 
     gaussians.training_setup(opt)
-    if checkpoint:
-        (model_params, first_iter) = torch.load(checkpoint)
-        gaussians.restore(model_params, opt)
 
+    # the gaussian restore in the HAC code takes the denom operator dkue to which the restore operation needs to be modified to work properly.
+    # if opt.include_feature:
+    #     if not checkpoint:
+    #         raise ValueError("checkpoint missing!!!!!")
+    # # this may not work for the HAC code as it includes not only points but MLP as well.
+    # if checkpoint:
+    #     (model_params, first_iter) = torch.load(checkpoint)
+    #     gaussians.restore(model_params, opt)
+
+    
     iter_start = torch.cuda.Event(enable_timing = True)
     iter_end = torch.cuda.Event(enable_timing = True)
 
@@ -118,6 +126,10 @@ def training(args_param, dataset, opt, pipe, dataset_name, testing_iterations, s
     first_iter += 1
     torch.cuda.synchronize(); t_start = time.time()
     log_time_sub = 0
+
+    # also count the length of model params before running this code
+    # if opt.include_feature:
+    #     first_iter == 0
     for iteration in range(first_iter, opt.iterations + 1):
         # network gui not available in scaffold-gs yet
         if network_gui.conn == None:
@@ -127,7 +139,7 @@ def training(args_param, dataset, opt, pipe, dataset_name, testing_iterations, s
                 net_image_bytes = None
                 custom_cam, do_training, pipe.convert_SHs_python, pipe.compute_cov3D_python, keep_alive, scaling_modifer = network_gui.receive()
                 if custom_cam != None:
-                    net_image = render(custom_cam, gaussians, pipe, background, scaling_modifer)["render"]
+                    net_image = render(custom_cam, gaussians, pipe, background, opt, scaling_modifer)["render"]
                     net_image_bytes = memoryview((torch.clamp(net_image, min=0, max=1.0) * 255).byte().permute(1, 2, 0).contiguous().cpu().numpy())
                 network_gui.send(net_image_bytes, dataset.source_path)
                 if do_training and ((iteration < int(opt.iterations)) or not keep_alive):
@@ -154,8 +166,8 @@ def training(args_param, dataset, opt, pipe, dataset_name, testing_iterations, s
         voxel_visible_mask = prefilter_voxel(viewpoint_cam, gaussians, pipe, background)
         # voxel_visible_mask:bool = radii_pure > 0: 应该是[N_anchor]?
         retain_grad = (iteration < opt.update_until and iteration >= 0)
-        render_pkg = render(viewpoint_cam, gaussians, pipe, background, visible_mask=voxel_visible_mask, retain_grad=retain_grad, step=iteration)
-        image, viewspace_point_tensor, visibility_filter, offset_selection_mask, radii, scaling, opacity = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["selection_mask"], render_pkg["radii"], render_pkg["scaling"], render_pkg["neural_opacity"]
+        render_pkg = render(viewpoint_cam, gaussians, pipe, background, opt.include_feature, visible_mask=voxel_visible_mask, retain_grad=retain_grad, step=iteration)
+        image, language_feature, viewspace_point_tensor, visibility_filter, offset_selection_mask, radii, scaling, opacity = render_pkg["render"], render_pkg["language_feature_image"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["selection_mask"], render_pkg["radii"], render_pkg["scaling"], render_pkg["neural_opacity"]
         # image: [3, H, W]. inited as: torch::full({NUM_CHANNELS, H, W}, 0.0, float_opts);
         # viewspace_point_tensor=screenspace_points: [N_opacity_pos_gaussian, 3]
         # visibility_filter: radii > 0. 其中 radii inited as: torch::full({P}, 0, means3D.options().dtype(torch::kInt32)); 其中P=N_opacity_pos_gaussian
@@ -187,13 +199,24 @@ def training(args_param, dataset, opt, pipe, dataset_name, testing_iterations, s
                 mask_1_rate, mask_size_bit, mask_size_MB, mask_numel = get_binary_vxl_size(binary_grid_masks + 0.0)  # [0, 1] -> [-1, 1]
             logger.info("\n-----[ITER {}] bits info: 1_rate_mask={}, mask_numel={}, mask_size_MB={}-----".format(iteration, mask_1_rate, mask_numel, mask_size_MB))
 
-        gt_image = viewpoint_cam.original_image.cuda()
-        Ll1 = l1_loss(image, gt_image)
+        if not opt.include_feature:
+            gt_image = viewpoint_cam.original_image.cuda()
+            Ll1 = l1_loss(image, gt_image)
 
-        ssim_loss = (1.0 - ssim(image, gt_image))
-        scaling_reg = scaling.prod(dim=1).mean()
-        loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * ssim_loss + 0.01*scaling_reg
+            ssim_loss = (1.0 - ssim(image, gt_image))
+            scaling_reg = scaling.prod(dim=1).mean()
+            loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * ssim_loss + 0.01*scaling_reg
 
+        else:
+            gt_image = viewpoint_cam.original_image.cuda()
+            Ll1 = l1_loss(image, gt_image)
+            ssim_loss = (1.0 - ssim(image, gt_image))
+            scaling_reg = scaling.prod(dim=1).mean()
+            # loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * ssim_loss + 0.01*scaling_reg
+            gt_language_feature, language_feature_mask = viewpoint_cam.get_language_feature(language_feature_dir=dataset.lf_path, feature_level=dataset.feature_level)
+            LangLoss = l1_loss(language_feature*language_feature_mask, gt_language_feature*language_feature_mask)            
+            loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * ssim_loss + 0.01*scaling_reg + opt.lambda_lang * LangLoss
+            
         if bit_per_param is not None:
             _, bit_hash_grid, MB_hash_grid, _ = get_binary_vxl_size((gaussians.get_encoding_params()+1)/2)
             denom = gaussians._anchor.shape[0]*(gaussians.feat_dim+6+3*gaussians.n_offsets)
@@ -217,7 +240,7 @@ def training(args_param, dataset, opt, pipe, dataset_name, testing_iterations, s
 
             # Log and save
             torch.cuda.synchronize(); t_start_log = time.time()
-            training_report(tb_writer, dataset_name, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background), wandb, logger, args_param.model_path)
+            training_report(tb_writer, dataset_name, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, gaussians, scene, render, (pipe, background), wandb, logger, args_param.model_path)
             if (iteration in saving_iterations):
                 logger.info("\n[ITER {}] Saving Gaussians".format(iteration))
                 scene.save(iteration)
@@ -247,43 +270,67 @@ def training(args_param, dataset, opt, pipe, dataset_name, testing_iterations, s
             if iteration < opt.iterations:
                 gaussians.optimizer.step()
                 gaussians.optimizer.zero_grad(set_to_none = True)
-            if (iteration in checkpoint_iterations):
-                logger.info("\n[ITER {}] Saving Checkpoint".format(iteration))
-                torch.save((gaussians.capture(), iteration), scene.model_path + "/chkpnt" + str(iteration) + ".pth")
+            # if (iteration in checkpoint_iterations):
+            #     logger.info("\n[ITER {}] Saving Checkpoint".format(iteration))
+            #     torch.save((gaussians.capture(), iteration), scene.model_path + "/chkpnt" + str(iteration) + ".pth")
 
     torch.cuda.synchronize(); t_end = time.time()
     logger.info("\n Total Training time: {}".format(t_end-t_start-log_time_sub))
 
     return gaussians.x_bound_min, gaussians.x_bound_max
 
-def prepare_output_and_logger(args):
+def prepare_output_and_logger(args):    
     if not args.model_path:
         if os.getenv('OAR_JOB_ID'):
             unique_str=os.getenv('OAR_JOB_ID')
         else:
             unique_str = str(uuid.uuid4())
         args.model_path = os.path.join("./output/", unique_str[0:10])
-
+        
     # Set up output folder
     print("Output folder: {}".format(args.model_path))
     os.makedirs(args.model_path, exist_ok = True)
     with open(os.path.join(args.model_path, "cfg_args"), 'w') as cfg_log_f:
         cfg_log_f.write(str(Namespace(**vars(args))))
+    log_path = os.path.join(args.model_path, 'logs')
+    makedirs(log_path, exist_ok=True)
+    # modify the code to include different versions
+    version_list = [int(f.split("_")[1]) for f in os.listdir(log_path) if f.startswith("version_")]
 
     # Create Tensorboard writer
     tb_writer = None
     if TENSORBOARD_FOUND:
-        tb_writer = SummaryWriter(args.model_path)
+        tb_writer = SummaryWriter(os.path.join(args.model_path, f'logs/version_{len(version_list)}'))
     else:
         print("Tensorboard not available: not logging progress")
     return tb_writer
 
 
-def training_report(tb_writer, dataset_name, iteration, Ll1, loss, l1_loss, elapsed, testing_iterations, scene : Scene, renderFunc, renderArgs, wandb=None, logger=None, pre_path_name=''):
+def training_report(tb_writer, dataset_name, iteration, Ll1, loss, l1_loss, elapsed, testing_iterations, gaussians, scene : Scene, renderFunc, renderArgs, wandb=None, logger=None, pre_path_name=''):
     if tb_writer:
         tb_writer.add_scalar(f'{dataset_name}/train_loss_patches/l1_loss', Ll1.item(), iteration)
         tb_writer.add_scalar(f'{dataset_name}/train_loss_patches/total_loss', loss.item(), iteration)
         tb_writer.add_scalar(f'{dataset_name}/iter_time', elapsed, iteration)
+        color_mlp = gaussians.get_color_mlp
+        cov_mlp = gaussians.get_cov_mlp
+        opacity_mlp = gaussians.get_opacity_mlp
+        lang_feat_mlp = gaussians.get_lang_feat_mlp
+
+        for name, param in color_mlp.named_parameters():
+            tb_writer.add_scalar(f'{dataset_name}/color/{name}_data', param.data.mean(), iteration)
+            tb_writer.add_scalar(f'{dataset_name}/color/{name}_grad', param.grad.mean(), iteration)
+
+        for name, param in cov_mlp.named_parameters():
+            tb_writer.add_scalar(f'{dataset_name}/cov/{name}_data', param.data.mean(), iteration)
+            tb_writer.add_scalar(f'{dataset_name}/cov/{name}_grad', param.grad.mean(), iteration)
+
+        for name, param in opacity_mlp.named_parameters():
+            tb_writer.add_scalar(f'{dataset_name}/opacity/{name}_data', param.data.mean(), iteration)
+            tb_writer.add_scalar(f'{dataset_name}/opacity/{name}_grad', param.grad.mean(), iteration)
+
+        for name, param in lang_feat_mlp.named_parameters():
+            tb_writer.add_scalar(f'{dataset_name}/lang_feat/{name}_data', param.data.mean(), iteration)
+            tb_writer.add_scalar(f'{dataset_name}/lang_feat/{name}_grad', param.grad.mean(), iteration)
 
     if wandb is not None:
         wandb.log({"train_l1_loss":Ll1, 'train_total_loss':loss, })
@@ -327,7 +374,7 @@ def training_report(tb_writer, dataset_name, iteration, Ll1, loss, l1_loss, elap
 
                     for idx, viewpoint in enumerate(config['cameras']):
                         torch.cuda.synchronize(); t_start = time.time()
-                        voxel_visible_mask = prefilter_voxel(viewpoint, scene.gaussians, *renderArgs)
+                        voxel_visible_mask = prefilter_voxel(viewpoint, scene.gaussians,  *renderArgs)
                         # image = torch.clamp(renderFunc(viewpoint, scene.gaussians, *renderArgs, visible_mask=voxel_visible_mask)["render"], 0.0, 1.0)
                         render_output = renderFunc(viewpoint, scene.gaussians, *renderArgs, visible_mask=voxel_visible_mask)
                         image = torch.clamp(render_output["render"], 0.0, 1.0)
@@ -386,10 +433,15 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
     render_path = os.path.join(model_path, name, "ours_{}".format(iteration), "renders")
     error_path = os.path.join(model_path, name, "ours_{}".format(iteration), "errors")
     gts_path = os.path.join(model_path, name, "ours_{}".format(iteration), "gt")
-
+    render_npy_path = os.path.join(model_path, name, "ours_{}".format(iteration), "renders_npy")
+    gts_npy_path = os.path.join(model_path, name, "ours_{}".format(iteration), "gt_npy")
+    
+    
     makedirs(render_path, exist_ok=True)
     makedirs(error_path, exist_ok=True)
     makedirs(gts_path, exist_ok=True)
+    makedirs(render_npy_path, exist_ok=True)
+    makedirs(gts_npy_path, exist_ok=True)
 
     t_list = []
     visible_count_list = []
@@ -409,9 +461,12 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
         rendering = torch.clamp(render_pkg["render"], 0.0, 1.0)
         visible_count = (render_pkg["radii"] > 0).sum()
         visible_count_list.append(visible_count)
+        lang_feats = render_pkg["language_feature_image"]
 
         # gts
         gt = view.original_image[0:3, :, :]
+        data_path = '/home/anubhav/datasets/fire'
+        gt_lang_feats, mask = view.get_language_feature(os.path.join(data_path, args.language_features_name), feature_level=args.feature_level)
 
         #
         gt_image = torch.clamp(view.original_image.to("cuda"), 0.0, 1.0)
@@ -422,12 +477,13 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
         # error maps
         errormap = (rendering - gt).abs()
 
-
         name_list.append('{0:05d}'.format(idx) + ".png")
         torchvision.utils.save_image(rendering, os.path.join(render_path, '{0:05d}'.format(idx) + ".png"))
         torchvision.utils.save_image(errormap, os.path.join(error_path, '{0:05d}'.format(idx) + ".png"))
         torchvision.utils.save_image(gt, os.path.join(gts_path, '{0:05d}'.format(idx) + ".png"))
         per_view_dict['{0:05d}'.format(idx) + ".png"] = visible_count.item()
+        np.save(os.path.join(render_npy_path, '{0:05d}'.format(idx) + ".npy"),lang_feats.permute(1,2,0).cpu().numpy())
+        np.save(os.path.join(gts_npy_path, '{0:05d}'.format(idx) + ".npy"),gt_lang_feats.permute(1,2,0).cpu().numpy())
 
     with open(os.path.join(model_path, name, "ours_{}".format(iteration), "per_view_count.json"), 'w') as fp:
             json.dump(per_view_dict, fp, indent=True)
@@ -597,7 +653,7 @@ if __name__ == "__main__":
     # parser.add_argument("--save_iterations", nargs="+", type=int, default=[11_000, 15_000, 20_000, 25_000, 29_000, 30_000])
     parser.add_argument("--save_iterations", nargs="+", type=int, default=[30_000])
     parser.add_argument("--quiet", action="store_true")
-    parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[])
+    parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[30_000])
     parser.add_argument("--start_checkpoint", type=str, default = None)
     parser.add_argument("--gpu", type=str, default = '-1')
     parser.add_argument("--log2", type=int, default = 13)
@@ -607,6 +663,10 @@ if __name__ == "__main__":
     args = parser.parse_args(sys.argv[1:])
     args.save_iterations.append(args.iterations)
 
+    args.iterations = 100
+    args.checkpoint_iterations = [100]
+    args.save_iterations = [100]
+    args.test_iterations = [100]
 
     # enable logging
 
@@ -644,7 +704,9 @@ if __name__ == "__main__":
     else:
         wandb = None
 
-    logger.info("Optimizing " + args.model_path)
+
+    args.model_path = args.model_path + f"_{str(args.feature_level)}"
+    print("Optimizing " + args.model_path)
 
     # Initialize system state (RNG)
     safe_state(args.quiet)
